@@ -3,6 +3,7 @@ import json
 import re
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
+import subprocess
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 # Data storage: use in-memory structures only (no persistent DB)
@@ -27,18 +28,20 @@ class UroflowmetryApp:
         # Apply styles before creating widgets so themed widgets use them
         # Initialize session state (no persistent DB)
         # keep only live-sample and UI-related state here
-        self.server_port = 5000
+        self.server_port = 0
         self.device_connected = False
         self.live_samples = []
         self.sample_interval = 0.3
         self._last_live_len = 0
         # Note: connector thread removed — connect_device will read one batch
         # of samples and populate `self.live_samples` for a single-shot plot.
-        # Total graph duration (seconds)
-        self.graph_total_duration = 40.0
-        # Flowrate limits (mL/s)
+        # Sampling: 400 samples at 300ms interval = 120 seconds total test time
+        self.sample_interval = 0.3  # 300ms per sample
+        self.graph_total_duration = 120.0  # 400 samples × 0.3s = 120s
+        # Flowrate limits (units: mL). Adjusted for device scale
+        # Device mapping: raw 0 -> 0 mL, raw 1200 -> 1000 mL (linear)
         self.flowrate_min = 0.0
-        self.flowrate_max = 50.0
+        self.flowrate_max = 1000.0
         self.setup_styles()
         self.create_widgets()
 
@@ -157,6 +160,50 @@ class UroflowmetryApp:
         # Deprecated: report controls moved to Test & Graph tab.
         pass
 
+    def _debug_log_tcp(self, data: bytes):
+        """Append a small debug record for raw TCP payloads.
+
+        Writes a timestamped entry to ~/uro_tcp_debug.log and prints a
+        concise summary (hex prefix + safe-decoded text) to stdout.
+        """
+        try:
+            if not data:
+                return
+            # safe text representation
+            text = data.decode(errors='replace')
+            hexdump = data.hex()
+            # keep hex summary reasonably small
+            hex_summary = hexdump[:200]
+            log_path = os.path.expanduser('~/uro_tcp_debug.log')
+            timestamp = datetime.now().isoformat()
+            with open(log_path, 'ab') as f:
+                f.write(f"--- {timestamp} ---\n".encode('utf-8'))
+                f.write(data + b"\n")
+            # Prefer decimal output: if data looks like 16-bit samples, print
+            # them as unsigned decimals separated by a single space. Otherwise
+            # fall back to printing each byte as decimal separated by spaces.
+            try:
+                dec_str = None
+                # limit detailed decimal output length to avoid huge prints
+                max_dec_chars = 1000
+                if len(data) >= 2 and len(data) % 2 == 0 and len(data) <= 1600:
+                    import struct
+                    num = len(data) // 2
+                    vals = struct.unpack(f'<{num}H', data)
+                    dec_str = ' '.join(str(v) for v in vals)
+                else:
+                    dec_str = ' '.join(str(b) for b in data)
+                if len(dec_str) > max_dec_chars:
+                    print(f"[TCP DEBUG] {len(data)} bytes, decimal={dec_str[:max_dec_chars]}...")
+                else:
+                    print(f"[TCP DEBUG] {len(data)} bytes, decimal={dec_str}")
+            except Exception:
+                # fallback to hex/text if decimal formatting fails
+                print(f"[TCP DEBUG] {len(data)} bytes, hex={hex_summary}{'...' if len(hexdump)>200 else ''}")
+            print(f"[TCP TEXT] {text}")
+        except Exception as e:
+            print(f"[TCP DEBUG] logging failed: {e}")
+
 
     # server queue and polling removed — live samples should be pushed directly
     # into `self.live_samples` by external code or device handlers.
@@ -230,8 +277,8 @@ class UroflowmetryApp:
         """Simple toggle for device connection state. This is a lightweight UI affordance
         that can later be extended to perform device-specific handshake/initialisation.
         """
-        host = '127.0.0.1'  # Server IP address
-        port = 65432        # Server port
+        host = '192.168.1.2'  # Server IP address
+        port = 4244        # Server port
 
         # For this build we perform a single-shot fetch of data from the device
         # and render the plot for that batch only. Toggling the button will
@@ -241,37 +288,92 @@ class UroflowmetryApp:
             try:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                     s.connect((host, port))
-                    s.settimeout(2)
+                    s.settimeout(300)  # 5 minutes timeout
+                    # Send command: 2 bytes 0x30 0x30
+                    try:
+                        s.send(b'\x30\x30')
+                        print("[TCP CMD] Sent command: 0x30 0x30")
+                    except Exception as e:
+                        print(f"[TCP CMD] Failed to send command: {e}")
                     try:
                         data = s.recv(65536)
-                        print(f"Received data: {data}")
+                        # Log raw TCP payload for debugging (hex + safe text)
+                        try:
+                            self._debug_log_tcp(data)
+                        except Exception:
+                            # fallback to simple print if helper fails
+                            print(f"Received data (raw): {data}")
                     except socket.timeout:
                         data = b''
 
                 if data:
-                    text = data.decode(errors='ignore').strip()
                     flows = []
-                    # try JSON first
-                    try:
-                        obj = json.loads(text)
-                        if isinstance(obj, list):
-                            flows = [float(x) for x in obj]
-                        elif isinstance(obj, dict):
-                            # try common keys
-                            for k in ('samples', 'flow_rates', 'flows', 'data'):
-                                if k in obj and isinstance(obj[k], list):
-                                    flows = [float(x) for x in obj[k]]
-                                    break
-                            if not flows:
-                                # single value
-                                for k in ('flow_rate', 'flow', 'value'):
-                                    if k in obj:
-                                        flows = [float(obj[k])]
+                    # Try to parse 16-bit samples (800 bytes = 400 samples)
+                    if len(data) >= 2:
+                        try:
+                            # Parse as 16-bit unsigned integers (little-endian)
+                            import struct
+                            num_samples = len(data) // 2
+                            raw_vals = list(struct.unpack(f'<{num_samples}H', data[:num_samples*2]))
+                            # Interpret raw samples as cumulative or monotonic sensor
+                            # readings mapped linearly: raw 0 -> 0 mL, raw 1200 -> 1000 mL
+                            # Compute instantaneous flow (mL/s) using the formula
+                            # requested: (previous_raw - current_raw) / dt, then
+                            # convert raw-units/s -> mL/s via raw_per_ml.
+                            raw_zero = 0
+                            raw_per_ml = 1.2  # raw units per mL
+                            dt = float(getattr(self, 'sample_interval', 0.3))
+
+                            flows = []
+                            if not raw_vals:
+                                flows = []
+                            elif len(raw_vals) == 1:
+                                flows = [0.0]
+                            else:
+                                # For first point, append zero flow (no previous sample)
+                                flows = [0.0]
+                                for i in range(1, len(raw_vals)):
+                                    prev_raw = float(raw_vals[i-1])
+                                    curr_raw = float(raw_vals[i])
+                                    # user-specified: previous minus current raw
+                                    diff_raw = prev_raw - curr_raw
+                                    # convert raw difference to mL: diff_raw / raw_per_ml
+                                    diff_ml = diff_raw / raw_per_ml
+                                    # divide by dt to get mL/s
+                                    flow = diff_ml / dt if dt > 0 else 0.0
+                                    # negative flow is not meaningful here; clamp
+                                    if flow < 0:
+                                        flow = 0.0
+                                    flows.append(float(flow))
+                            print(f"[TCP PARSE] Parsed {num_samples} 16-bit samples -> computed {len(flows)} flow samples (example: {flows[:10]}...) ")
+                        except Exception as e:
+                            print(f"[TCP PARSE] 16-bit parse failed: {e}")
+                            flows = []
+                    
+                    # Fallback: try text-based parsing
+                    if not flows:
+                        text = data.decode(errors='ignore').strip()
+                        # try JSON first
+                        try:
+                            obj = json.loads(text)
+                            if isinstance(obj, list):
+                                flows = [float(x) for x in obj]
+                            elif isinstance(obj, dict):
+                                # try common keys
+                                for k in ('samples', 'flow_rates', 'flows', 'data'):
+                                    if k in obj and isinstance(obj[k], list):
+                                        flows = [float(x) for x in obj[k]]
                                         break
-                    except Exception:
-                        # fallback: extract numeric substrings (handles formats
-                        # like Python set repr '{5, 7, 8, ...}' as well as CSV/newlines)
-                        nums = re.findall(r'[-+]?\d*\.\d+(?:[eE][-+]?\d+)?|[-+]?\d+', text)
+                                if not flows:
+                                    # single value
+                                    for k in ('flow_rate', 'flow', 'value'):
+                                        if k in obj:
+                                            flows = [float(obj[k])]
+                                            break
+                        except Exception:
+                            # fallback: extract numeric substrings (handles formats
+                            # like Python set repr '{5, 7, 8, ...}' as well as CSV/newlines)
+                            nums = re.findall(r'[-+]?\d*\.\d+(?:[eE][-+]?\d+)?|[-+]?\d+', text)
                         for p in nums:
                             try:
                                 flows.append(float(p))
@@ -348,13 +450,28 @@ class UroflowmetryApp:
             messagebox.showerror('Error', 'No live samples available to include in PDF')
             return
 
-        file_path = filedialog.asksaveasfilename(defaultextension='.pdf', filetypes=[('PDF files', '*.pdf')])
-        if not file_path:
-            return
+        # Generate default filename with current date and time (HR_MM format)
+        default_filename = datetime.now().strftime('%Y-%m-%d_%H_%M') + '.pdf'
+        default_dir = '/home/prashantk39/work/picow/'
+        
+        # Ensure directory exists
+        os.makedirs(default_dir, exist_ok=True)
+        
+        # Auto-save to default location
+        file_path = os.path.join(default_dir, default_filename)
 
         try:
             self._generate_pdf_from_live(file_path)
-            messagebox.showinfo('Success', f'PDF Report saved: {file_path}')
+            messagebox.showinfo('Success', f'PDF Report auto-saved: {file_path}')
+            
+            # Print the PDF using lp command
+            try:
+                subprocess.run(['lp', '-d', 'DCPT220', file_path], check=True, capture_output=True)
+                messagebox.showinfo('Print', f'PDF sent to printer DCPT220')
+            except subprocess.CalledProcessError as pe:
+                messagebox.showwarning('Print Warning', f'Failed to print PDF: {pe}')
+            except Exception as pe:
+                messagebox.showwarning('Print Warning', f'Print command error: {pe}')
         except Exception as e:
             messagebox.showerror('Error', f'Failed to generate PDF: {e}')
     def _generate_pdf_from_live(self, file_path):
