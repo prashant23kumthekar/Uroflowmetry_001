@@ -38,10 +38,10 @@ class UroflowmetryApp:
         # Sampling: 400 samples at 300ms interval = 120 seconds total test time
         self.sample_interval = 0.3  # 300ms per sample
         self.graph_total_duration = 120.0  # 400 samples × 0.3s = 120s
-        # Flowrate limits (units: mL). Adjusted for device scale
+        # Flowrate limits (units: mL/s). Y-axis range for flow rate graph
         # Device mapping: raw 0 -> 0 mL, raw 1200 -> 1000 mL (linear)
         self.flowrate_min = 0.0
-        self.flowrate_max = 1000.0
+        self.flowrate_max = 50.0  # mL/s max on y-axis
         self.setup_styles()
         self.create_widgets()
 
@@ -277,7 +277,7 @@ class UroflowmetryApp:
         """Simple toggle for device connection state. This is a lightweight UI affordance
         that can later be extended to perform device-specific handshake/initialisation.
         """
-        host = '192.168.1.2'  # Server IP address
+        host = '192.168.1.3'  # Server IP address
         port = 4244        # Server port
 
         # For this build we perform a single-shot fetch of data from the device
@@ -335,8 +335,8 @@ class UroflowmetryApp:
                                 for i in range(1, len(raw_vals)):
                                     prev_raw = float(raw_vals[i-1])
                                     curr_raw = float(raw_vals[i])
-                                    # user-specified: previous minus current raw
-                                    diff_raw = prev_raw - curr_raw
+                                    # compute raw difference as current minus previous
+                                    diff_raw = curr_raw - prev_raw
                                     # convert raw difference to mL: diff_raw / raw_per_ml
                                     diff_ml = diff_raw / raw_per_ml
                                     # divide by dt to get mL/s
